@@ -1,0 +1,1 @@
+improved-dynamodb-auto-scaling
