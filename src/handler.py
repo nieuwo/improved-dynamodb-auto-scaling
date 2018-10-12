@@ -7,52 +7,88 @@ import json
 def lambda_handler(event, context):
     try:
         for record in event["Records"]:
+            minIncrementor = 5
             message = json.loads(record["Sns"]["Message"])
             alarmName = message["AlarmName"]
             namespace = message["Trigger"]["Namespace"]
             metricName = message["Trigger"]["MetricName"]
             tableName = message["Trigger"]["Dimensions"][0]["value"]
-            snsTopic = record["EventSubscriptionArn"]
+            snsTopic = record["Sns"]["TopicArn"]
             cfg = Config()
-            cloudwatch = boto3.client("cloudwatch", region_name=cfg.AWSRegion)
+            cloudwatch = boto3.client("cloudwatch",
+                                      region_name=cfg.AWSRegion)
+            print(metricName)
+            response = cloudwatch.get_metric_statistics(Namespace=namespace,
+                                                        MetricName=metricName,
+                                                        Dimensions=[{"Name": "TableName", "Value": tableName}],
+                                                        StartTime=datetime.now() - timedelta(minutes=minIncrementor),
+                                                        EndTime=datetime.now(),
+                                                        Period=cfg.CloudWatchPeriod,
+                                                        Statistics=["Sum"])
 
-            response = cloudwatch.get_metric_statistics(
-                Namespace=namespace,
-                MetricName=metricName,
-                Dimensions=[{"Name": "TableName", "Value": tableName}],
-                StartTime=datetime.utcnow() - timedelta(minutes=5),
-                EndTime=datetime.utcnow(),
-                Period=cfg.CloudWatchPeriod,
-                Statistics=["Sum"])
+            while len(response["Datapoints"]) == 0:
+                minIncrementor = minIncrementor + 15
+                response = cloudwatch.get_metric_statistics(Namespace=namespace,
+                                                            MetricName=metricName,
+                                                            Dimensions=[{"Name": "TableName", "Value": tableName}],
+                                                            StartTime=datetime.now() - timedelta(minutes=minIncrementor),
+                                                            EndTime=datetime.now(),
+                                                            Period=cfg.CloudWatchPeriod,
+                                                            Statistics=["Sum"])
 
-            maxReqsCount = max([dp["Sum"]
-                                for dp in response["Datapoints"]])
+            maxReqsCount = max([dp["Sum"] for dp in response["Datapoints"]])
             newThroughput = round(
                 min(1000, maxReqsCount / cfg.UtilizationLevel / cfg.CloudWatchPeriod))
+            if newThroughput == 0:
+                newThroughput = 1
 
             newThreshold = round(
                 (newThroughput * cfg.CloudWatchPeriod * cfg.UtilizationLevel))
 
-            dynamodb = boto3.client("dynamodb", region_name=cfg.AWSRegion)
+            provisionedWriteThroughput = newThroughput
+            provisionedReadThroughput = newThroughput
+
+            dynamodb = boto3.client("dynamodb",
+                                    region_name=cfg.AWSRegion)
 
             table = dynamodb.describe_table(TableName=tableName)
             lastDecreaseDateTime = table["Table"]["ProvisionedThroughput"]["LastDecreaseDateTime"]
             lastDecreaseTime = (datetime.now(tz=timezone.utc) - lastDecreaseDateTime) / timedelta(minutes=1)
-            oldWriteCapacityUnits = table["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"]
-            oldReadCapacityUnits = table["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"]
+            updateAlarms = False
+            if "WriteCapacityUnits" in metricName:
+                oldThroughput = table["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"]
+                provisionedReadThroughput = table["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"]
+                updateAlarms = True
+            elif "ReadCapacityUnits" in metricName:
+                oldThroughput = table["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"]
+                provisionedWriteThroughput = table["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"]
+                updateAlarms = True
 
-            if (lastDecreaseTime > 60 and newThroughput < oldWriteCapacityUnits) or newThroughput > oldWriteCapacityUnits:
-                print("%s newThroughput [%s] vs old [%s]" %
-                      (tableName, newThroughput, oldWriteCapacityUnits))
+            if updateAlarms:
+                updateDecreasedThroughPut = newThroughput < oldThroughput
+                updateIncreaseThroughPut = newThroughput > oldThroughput
 
-                dynamodb.update_table(TableName=tableName, ProvisionedThroughput={
-                                      "WriteCapacityUnits": newThroughput, "ReadCapacityUnits": oldReadCapacityUnits})
+                if (lastDecreaseTime > cfg.CloudWatchPeriod and updateDecreasedThroughPut) or updateIncreaseThroughPut:
+                    print("%s newThroughput [%s] vs old [%s]" % (tableName, newThroughput, oldThroughput))
 
-                cloudwatch.put_metric_alarm(AlarmName=alarmName, Namespace=namespace, MetricName=metricName, EvaluationPeriods=1, AlarmActions=[
-                                            snsTopic], Period=int(message["Trigger"]["Period"]), Threshold=newThroughput, ComparisonOperator=message["Trigger"]["ComparisonOperator"], Statistic="Sum")
+                    dynamodb.update_table(TableName=tableName,
+                                          ProvisionedThroughput={"WriteCapacityUnits": provisionedWriteThroughput, "ReadCapacityUnits": provisionedReadThroughput})
 
-                cloudwatch.set_alarm_state(
-                    AlarmName=alarmName, StateValue="OK", StateReason="Updated by dynamodb-autoscale")
+                    cloudwatch.put_metric_alarm(AlarmName=alarmName,
+                                                ActionsEnabled=True,
+                                                AlarmActions=[snsTopic],
+                                                MetricName=metricName,
+                                                Namespace=namespace,
+                                                Statistic="Sum",
+                                                Dimensions=[{"Name": "TableName", "Value": tableName}],
+                                                Period=int(message["Trigger"]["Period"]),
+                                                EvaluationPeriods=1,
+                                                Threshold=newThreshold,
+                                                ComparisonOperator=message["Trigger"]["ComparisonOperator"])
+
+                    cloudwatch.set_alarm_state(AlarmName=alarmName,
+                                               StateValue="OK",
+                                               StateReason="Updated by dynamodb-autoscale")
 
     except Exception as e:
         print(e)
