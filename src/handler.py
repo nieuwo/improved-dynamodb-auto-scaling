@@ -41,7 +41,7 @@ def lambda_handler(event, context):
             oldWriteCapacityUnits = table["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"]
             oldReadCapacityUnits = table["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"]
 
-            if (lastDecreaseTime >= 60 and newThroughput < oldWriteCapacityUnits) or newThroughput >= oldWriteCapacityUnits:
+            if (lastDecreaseTime >= 60 and newThroughput < oldWriteCapacityUnits) or newThroughput > oldWriteCapacityUnits:
                 print("%s newThroughput [%s] vs old [%s]" %
                       (tableName, newThroughput, oldWriteCapacityUnits))
 
